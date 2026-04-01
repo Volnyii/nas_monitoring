@@ -409,7 +409,7 @@ EOF
 <div class="card disk-card">
   <div class="card-title">$label <span class="dev">$dev$flag_badge</span></div>
   <div class="model">$model</div>
-  <div class="smart-age">SMART (полный): обновлено ${age_str} &nbsp;·&nbsp; температура: каждую минуту</div>
+  <div class="smart-age">SMART (полный): обновлено ${age_str} &nbsp;·&nbsp; температура: каждый час</div>
   <div class="attrs">
     <div class="attr"><span class="attr-name">Статус</span><span class="attr-val $sc">$status</span></div>
     <div class="attr"><span class="attr-name">Температура</span><span class="attr-val $tc">${temp:-н/д}°C</span></div>
