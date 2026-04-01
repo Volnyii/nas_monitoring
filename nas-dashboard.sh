@@ -4,14 +4,17 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # NAS Monitor — универсальный дашборд с историей метрик и графиками
 # Запускается через cron каждую минуту от root
 #
-# SMART-данные кэшируются — диски опрашиваются только раз в день,
-# системные метрики (CPU/RAM) обновляются каждую минуту без лишних обращений к пластинам.
+# Температура дисков — каждую минуту (smartctl -A -H, лёгкий запрос)
+# Полный SMART      — раз в сутки   (smartctl -a, читает журналы с пластин)
+#
+# ВАЖНО: ключи ассоциативных массивов используют безопасный формат _dev_sda
+# (без слешей), чтобы bash не пытался вычислить /dev/sda как арифметику в subshell.
 
 OUTPUT="/var/www/nas-dashboard/index.html"
 METRICS_CSV="/var/www/nas-dashboard/metrics.csv"
 CSV_MAX_LINES=10080     # 7 суток × 1440 мин
-SMART_FULL_TTL=86400    # полный SMART (здоровье, секторы, ошибки) — раз в сутки
-SMART_TEMP_TTL=60       # температура (лёгкий запрос -A -H) — каждую минуту
+SMART_FULL_TTL=86400    # полный SMART — раз в сутки
+SMART_TEMP_TTL=60       # температура  — каждую минуту
 UPDATED=$(date '+%d.%m.%Y %H:%M:%S')
 TS=$(date '+%Y-%m-%d %H:%M')
 
@@ -56,23 +59,19 @@ if command -v sensors &>/dev/null; then
     fi
 fi
 
-# Температура GPU (Intel integrated / дискретная / hwmon)
+# Температура GPU (Intel / AMD / Nvidia)
 GPU_TEMP=""
 for f in /sys/class/drm/card0/device/hwmon/hwmon*/temp1_input \
           /sys/class/drm/card1/device/hwmon/hwmon*/temp1_input; do
     [ -r "$f" ] || continue
     val=$(cat "$f" 2>/dev/null)
     if [ -n "$val" ] && [ "$val" -gt 1000 ] 2>/dev/null; then
-        GPU_TEMP=$((val / 1000))
-        break
+        GPU_TEMP=$((val / 1000)); break
     fi
 done
 if [ -z "$GPU_TEMP" ] && command -v sensors &>/dev/null; then
-    GPU_TEMP=$(sensors 2>/dev/null \
-        | grep -iE "^(GPU|edge|junction):" \
-        | head -1 \
-        | grep -oP '[+-]\K[0-9]+\.[0-9]+' \
-        | head -1)
+    GPU_TEMP=$(sensors 2>/dev/null | grep -iE "^(GPU|edge|junction):" \
+        | head -1 | grep -oP '[+-]\K[0-9]+\.[0-9]+' | head -1)
 fi
 if [ -z "$GPU_TEMP" ] && command -v nvidia-smi &>/dev/null; then
     GPU_TEMP=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader 2>/dev/null \
@@ -98,6 +97,9 @@ bar() {
     echo "<div class=\"bar-wrap\"><div class=\"bar $c\" style=\"width:${p}%\"></div></div>"
 }
 
+# Безопасный ключ для ассоциативных массивов: /dev/sda → _dev_sda
+safe_key() { echo "${1//\//_}"; }
+
 # ===========================================================================
 # Автоопределение дисков и флага smartctl
 # ===========================================================================
@@ -106,7 +108,7 @@ detect_disks() {
     lsblk -dpno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}'
 }
 
-# Базовый зонд без кэша (используется внутри probe_smart_cached)
+# Базовый зонд — перебирает флаги, устанавливает SMART_DATA и SMART_FLAG
 probe_smart() {
     local dev=$1
     local flags=("" "sat,12" "sat,16" "sat" "usbsunplus" "usbjmicron" "usbcypress")
@@ -118,28 +120,21 @@ probe_smart() {
             raw=$(/usr/sbin/smartctl -a "$dev" 2>/dev/null)
         fi
         if echo "$raw" | grep -q "overall-health"; then
-            SMART_DATA="$raw"
-            SMART_FLAG="$flag"
-            return 0
+            SMART_DATA="$raw"; SMART_FLAG="$flag"; return 0
         fi
     done
-    SMART_DATA=""
-    SMART_FLAG=""
-    return 1
+    SMART_DATA=""; SMART_FLAG=""; return 1
 }
 
-# Двухуровневый зонд с кэшем:
-#   _full.data — полный «smartctl -a» (раз в сутки): здоровье, секторы, журналы
-#   _temp.data — лёгкий «smartctl -A -H» (каждую минуту): только атрибуты + статус
+# Двухуровневый зонд с кэшем.
 # Результаты: SMART_FULL_DATA, SMART_TEMP_DATA, SMART_FLAG, SMART_FULL_AGE
 probe_disk() {
     local dev=$1
-    local safe="${dev//\//_}"
+    local safe; safe=$(safe_key "$dev")
     local full_f="/tmp/nas_smart_${safe}_full.data"
     local temp_f="/tmp/nas_smart_${safe}_temp.data"
     local flag_f="/tmp/nas_smart_${safe}.flag"
-    local now
-    now=$(date +%s)
+    local now; now=$(date +%s)
 
     # --- Полный SMART (раз в сутки) ---
     local full_age=99999
@@ -147,11 +142,9 @@ probe_disk() {
     SMART_FULL_AGE=$full_age
 
     if [ "$full_age" -ge "$SMART_FULL_TTL" ]; then
-        # Первый запуск или сутки прошли — полный опрос с автоопределением флага
         probe_smart "$dev"
         printf '%s' "$SMART_DATA" > "$full_f"
         printf '%s' "$SMART_FLAG" > "$flag_f"
-        # Полные данные используем и как temp-кэш (содержат атрибуты)
         printf '%s' "$SMART_DATA" > "$temp_f"
         SMART_FULL_DATA="$SMART_DATA"
         SMART_TEMP_DATA="$SMART_DATA"
@@ -161,7 +154,7 @@ probe_disk() {
     SMART_FULL_DATA=$(cat "$full_f")
     SMART_FLAG=$(cat "$flag_f" 2>/dev/null)
 
-    # --- Температура (каждую минуту, лёгкий запрос) ---
+    # --- Температура (каждую минуту, лёгкий запрос -A -H) ---
     local temp_age=99999
     [ -f "$temp_f" ] && temp_age=$(( now - $(stat -c %Y "$temp_f") ))
 
@@ -185,11 +178,7 @@ probe_disk() {
 
 parse_attr() {
     echo "$1" | awk -v id="$2" '
-        $1==id {
-            val=$10
-            sub(/[^0-9].*/, "", val)
-            print val; exit
-        }
+        $1==id { val=$10; sub(/[^0-9].*/, "", val); print val; exit }
     '
 }
 
@@ -218,14 +207,15 @@ parse_ata_err() {
 }
 
 # ===========================================================================
-# Pass 1: Зондируем все диски через кэш (не в subshell → массивы работают)
+# Pass 1: Зондируем все диски
+# Ключи ассоциативных массивов — безопасный формат (safe_key), без слешей
 # ===========================================================================
 
 declare -a ALL_DEVS=()
-declare -A PROBED_DATA=()       # полный SMART (раз в сутки)
-declare -A PROBED_TEMP=()       # данные температуры (каждую минуту)
-declare -A PROBED_FLAGS=()
-declare -A PROBED_FULL_AGE=()   # возраст полного кэша в секундах
+declare -A PROBED_DATA=()       # полный SMART
+declare -A PROBED_TEMP=()       # данные температуры
+declare -A PROBED_FLAGS=()      # рабочий флаг
+declare -A PROBED_FULL_AGE=()   # возраст полного кэша (числа, ключ без слешей)
 declare -a CSV_TEMP=()
 declare -a CSV_R5=()
 declare -a CSV_R197=()
@@ -234,14 +224,14 @@ declare -a CSV_R199=()
 while IFS= read -r dev; do
     ALL_DEVS+=("$dev")
     probe_disk "$dev"
-    PROBED_DATA["$dev"]="$SMART_FULL_DATA"
-    PROBED_TEMP["$dev"]="$SMART_TEMP_DATA"
-    PROBED_FLAGS["$dev"]="$SMART_FLAG"
-    PROBED_FULL_AGE["$dev"]="$SMART_FULL_AGE"
+    k=$(safe_key "$dev")
+    PROBED_DATA["$k"]="$SMART_FULL_DATA"
+    PROBED_TEMP["$k"]="$SMART_TEMP_DATA"
+    PROBED_FLAGS["$k"]="$SMART_FLAG"
+    PROBED_FULL_AGE["$k"]="$SMART_FULL_AGE"
 
-    # В CSV пишем температуру из свежих данных, остальное из полного кэша
     CSV_TEMP+=("$(parse_temp "$SMART_TEMP_DATA")")
-    CSV_R5+=("$(parse_attr  "$SMART_FULL_DATA" 5)")
+    CSV_R5+=("$(parse_attr   "$SMART_FULL_DATA" 5)")
     CSV_R197+=("$(parse_attr "$SMART_FULL_DATA" 197)")
     CSV_R199+=("$(parse_attr "$SMART_FULL_DATA" 199)")
 done < <(detect_disks)
@@ -252,17 +242,15 @@ done < <(detect_disks)
 
 expected_header="timestamp,cpu_temp,gpu_temp,cpu_load,ram_pct"
 for dev in "${ALL_DEVS[@]}"; do
-    ds="${dev//\//}"
+    ds=$(safe_key "$dev")
     expected_header="${expected_header},${ds}_temp,${ds}_r5,${ds}_r197,${ds}_r199"
 done
 
 if [ -f "$METRICS_CSV" ]; then
     actual_header=$(head -1 "$METRICS_CSV" 2>/dev/null)
-    if [ "$actual_header" != "$expected_header" ]; then
+    [ "$actual_header" != "$expected_header" ] && \
         mv "$METRICS_CSV" "${METRICS_CSV%.csv}_backup_$(date '+%Y%m%d_%H%M%S').csv"
-    fi
 fi
-
 [ ! -f "$METRICS_CSV" ] && echo "$expected_header" > "$METRICS_CSV"
 
 csv_line="$TS,${CPU_TEMP:-},${GPU_TEMP:-},${CPU_USED},${RAM_PCT}"
@@ -281,11 +269,8 @@ echo "$csv_line" >> "$METRICS_CSV"
 # ===========================================================================
 
 CHART_HAS_DATA=0
-CHART_LABELS=""
-CHART_CPU_TEMP_DATA=""
-CHART_GPU_TEMP_DATA=""
-CHART_CPU_LOAD_DATA=""
-CHART_RAM_DATA=""
+CHART_LABELS="" CHART_CPU_TEMP_DATA="" CHART_GPU_TEMP_DATA=""
+CHART_CPU_LOAD_DATA="" CHART_RAM_DATA=""
 CHART_DISK_TEMP_DATASETS="[]"
 CHART_DISK_R5_DATASETS="[]"
 CHART_DISK_R199_DATASETS="[]"
@@ -303,85 +288,56 @@ if [ -f "$METRICS_CSV" ] && [ -s "$METRICS_CSV" ]; then
 
     if [ "${LINE_COUNT:-0}" -gt 2 ]; then
         CHART_HAS_DATA=1
-
-        CHART_LABELS=$(echo "$CSV_DATA" \
-            | awk -F',' '{printf "\"%s\",",$1}' | sed 's/,$//')
-        CHART_CPU_TEMP_DATA=$(echo "$CSV_DATA" \
-            | awk -F',' '{print ($2=="" ? "null" : $2)}' | tr '\n' ',' | sed 's/,$//')
-        CHART_GPU_TEMP_DATA=$(echo "$CSV_DATA" \
-            | awk -F',' '{print ($3=="" ? "null" : $3)}' | tr '\n' ',' | sed 's/,$//')
-        CHART_CPU_LOAD_DATA=$(echo "$CSV_DATA" \
-            | awk -F',' '{print ($4=="" ? "null" : $4)}' | tr '\n' ',' | sed 's/,$//')
-        CHART_RAM_DATA=$(echo "$CSV_DATA" \
-            | awk -F',' '{print ($5=="" ? "null" : $5)}' | tr '\n' ',' | sed 's/,$//')
+        CHART_LABELS=$(echo "$CSV_DATA" | awk -F',' '{printf "\"%s\",",$1}' | sed 's/,$//')
+        CHART_CPU_TEMP_DATA=$(echo "$CSV_DATA" | awk -F',' '{print ($2=="" ? "null" : $2)}' | tr '\n' ',' | sed 's/,$//')
+        CHART_GPU_TEMP_DATA=$(echo "$CSV_DATA" | awk -F',' '{print ($3=="" ? "null" : $3)}' | tr '\n' ',' | sed 's/,$//')
+        CHART_CPU_LOAD_DATA=$(echo "$CSV_DATA" | awk -F',' '{print ($4=="" ? "null" : $4)}' | tr '\n' ',' | sed 's/,$//')
+        CHART_RAM_DATA=$(echo "$CSV_DATA"       | awk -F',' '{print ($5=="" ? "null" : $5)}' | tr '\n' ',' | sed 's/,$//')
 
         DISK_COLORS=("#ff9800" "#7c4dff" "#00bcd4" "#4caf50")
-        CHART_DISK_TEMP_DATASETS="["
-        CHART_DISK_R5_DATASETS="["
-        CHART_DISK_R199_DATASETS="["
+        CHART_DISK_TEMP_DATASETS="["; CHART_DISK_R5_DATASETS="["; CHART_DISK_R199_DATASETS="["
 
         for i in "${!ALL_DEVS[@]}"; do
             base_col=$((6 + i * 4))
-            col_temp=$base_col
-            col_r5=$((base_col + 1))
-            col_r199=$((base_col + 3))
-            dev="${ALL_DEVS[$i]}"
-            color="${DISK_COLORS[$((i % 4))]}"
-
-            t_data=$(echo "$CSV_DATA" | awk -F',' -v c="$col_temp" \
-                '{print ($c=="" ? "null" : $c)}' | tr '\n' ',' | sed 's/,$//')
-            r5_data=$(echo "$CSV_DATA" | awk -F',' -v c="$col_r5" \
-                '{print ($c=="" ? "null" : $c)}' | tr '\n' ',' | sed 's/,$//')
-            r199_data=$(echo "$CSV_DATA" | awk -F',' -v c="$col_r199" \
-                '{print ($c=="" ? "null" : $c)}' | tr '\n' ',' | sed 's/,$//')
-
-            ds_base="\"label\":\"${dev}\",\"borderColor\":\"${color}\","
-            ds_base+="\"backgroundColor\":\"${color}22\",\"borderWidth\":1.5,"
-            ds_base+="\"pointRadius\":0,\"tension\":0.3,\"fill\":false"
-
-            CHART_DISK_TEMP_DATASETS+="{${ds_base},\"data\":[${t_data}]},"
-            CHART_DISK_R5_DATASETS+="{${ds_base},\"data\":[${r5_data}]},"
-            CHART_DISK_R199_DATASETS+="{${ds_base},\"data\":[${r199_data}]},"
-
-            PEAK_DISK_TEMP_VAL[$i]=$(echo "$CSV_DATA" | awk -F',' -v c="$col_temp" '$c!=""' \
-                | sort -t',' -k"$col_temp" -rn | head -1 | cut -d',' -f"$col_temp")
-            PEAK_DISK_TEMP_TIME[$i]=$(echo "$CSV_DATA" | awk -F',' -v c="$col_temp" '$c!=""' \
-                | sort -t',' -k"$col_temp" -rn | head -1 | cut -d',' -f1)
+            dev="${ALL_DEVS[$i]}"; color="${DISK_COLORS[$((i % 4))]}"
+            t_data=$(echo "$CSV_DATA"   | awk -F',' -v c="$((base_col))"   '{print ($c=="" ? "null" : $c)}' | tr '\n' ',' | sed 's/,$//')
+            r5_data=$(echo "$CSV_DATA"  | awk -F',' -v c="$((base_col+1))" '{print ($c=="" ? "null" : $c)}' | tr '\n' ',' | sed 's/,$//')
+            r199_data=$(echo "$CSV_DATA"| awk -F',' -v c="$((base_col+3))" '{print ($c=="" ? "null" : $c)}' | tr '\n' ',' | sed 's/,$//')
+            ds="\"label\":\"${dev}\",\"borderColor\":\"${color}\",\"backgroundColor\":\"${color}22\",\"borderWidth\":1.5,\"pointRadius\":0,\"tension\":0.3,\"fill\":false"
+            CHART_DISK_TEMP_DATASETS+="{${ds},\"data\":[${t_data}]},"
+            CHART_DISK_R5_DATASETS+="{${ds},\"data\":[${r5_data}]},"
+            CHART_DISK_R199_DATASETS+="{${ds},\"data\":[${r199_data}]},"
+            PEAK_DISK_TEMP_VAL[$i]=$(echo "$CSV_DATA" | awk -F',' -v c="$base_col" '$c!=""' | sort -t',' -k"$base_col" -rn | head -1 | cut -d',' -f"$base_col")
+            PEAK_DISK_TEMP_TIME[$i]=$(echo "$CSV_DATA" | awk -F',' -v c="$base_col" '$c!=""' | sort -t',' -k"$base_col" -rn | head -1 | cut -d',' -f1)
         done
-
         CHART_DISK_TEMP_DATASETS="${CHART_DISK_TEMP_DATASETS%,}]"
         CHART_DISK_R5_DATASETS="${CHART_DISK_R5_DATASETS%,}]"
         CHART_DISK_R199_DATASETS="${CHART_DISK_R199_DATASETS%,}]"
 
-        PEAK_CPU_TEMP_VAL=$(echo "$CSV_DATA" | awk -F',' '$2!=""' \
-            | sort -t',' -k2 -rn | head -1 | cut -d',' -f2)
-        PEAK_CPU_TEMP_TIME=$(echo "$CSV_DATA" | awk -F',' '$2!=""' \
-            | sort -t',' -k2 -rn | head -1 | cut -d',' -f1)
-        PEAK_GPU_TEMP_VAL=$(echo "$CSV_DATA" | awk -F',' '$3!=""' \
-            | sort -t',' -k3 -rn | head -1 | cut -d',' -f3)
-        PEAK_GPU_TEMP_TIME=$(echo "$CSV_DATA" | awk -F',' '$3!=""' \
-            | sort -t',' -k3 -rn | head -1 | cut -d',' -f1)
-        PEAK_CPU_LOAD_VAL=$(echo "$CSV_DATA" | awk -F',' '$4!=""' \
-            | sort -t',' -k4 -rn | head -1 | cut -d',' -f4)
-        PEAK_CPU_LOAD_TIME=$(echo "$CSV_DATA" | awk -F',' '$4!=""' \
-            | sort -t',' -k4 -rn | head -1 | cut -d',' -f1)
-        PEAK_RAM_VAL=$(echo "$CSV_DATA" | awk -F',' '$5!=""' \
-            | sort -t',' -k5 -rn | head -1 | cut -d',' -f5)
-        PEAK_RAM_TIME=$(echo "$CSV_DATA" | awk -F',' '$5!=""' \
-            | sort -t',' -k5 -rn | head -1 | cut -d',' -f1)
+        PEAK_CPU_TEMP_VAL=$(echo "$CSV_DATA" | awk -F',' '$2!=""' | sort -t',' -k2 -rn | head -1 | cut -d',' -f2)
+        PEAK_CPU_TEMP_TIME=$(echo "$CSV_DATA" | awk -F',' '$2!=""' | sort -t',' -k2 -rn | head -1 | cut -d',' -f1)
+        PEAK_GPU_TEMP_VAL=$(echo "$CSV_DATA" | awk -F',' '$3!=""' | sort -t',' -k3 -rn | head -1 | cut -d',' -f3)
+        PEAK_GPU_TEMP_TIME=$(echo "$CSV_DATA" | awk -F',' '$3!=""' | sort -t',' -k3 -rn | head -1 | cut -d',' -f1)
+        PEAK_CPU_LOAD_VAL=$(echo "$CSV_DATA" | awk -F',' '$4!=""' | sort -t',' -k4 -rn | head -1 | cut -d',' -f4)
+        PEAK_CPU_LOAD_TIME=$(echo "$CSV_DATA" | awk -F',' '$4!=""' | sort -t',' -k4 -rn | head -1 | cut -d',' -f1)
+        PEAK_RAM_VAL=$(echo "$CSV_DATA"       | awk -F',' '$5!=""' | sort -t',' -k5 -rn | head -1 | cut -d',' -f5)
+        PEAK_RAM_TIME=$(echo "$CSV_DATA"      | awk -F',' '$5!=""' | sort -t',' -k5 -rn | head -1 | cut -d',' -f1)
     fi
 fi
 
 # ===========================================================================
 # HTML-блок одного диска
+# Все данные передаются параметрами — ассоциативные массивы не используются
+# внутри subshell (чтобы избежать bash-бага с ключами /dev/sdX)
 # ===========================================================================
 
 disk_block() {
     local dev=$1
     local label=$2
-    local data="${PROBED_DATA[$dev]}"
-    local flagused="${PROBED_FLAGS[$dev]}"
-    local cache_age="${PROBED_CACHE_AGE[$dev]:-0}"
+    local data=$3
+    local flagused=$4
+    local full_age=${5:-0}
+    local temp_data=$6
 
     if [ -z "$data" ]; then
         cat <<EOF
@@ -396,13 +352,13 @@ EOF
     local model status temp r5 r197 r198 r199 r9 r12 ata_err
     model=$(parse_model "$data")
     status=$(parse_status "$data")
-    temp=$(parse_temp "${PROBED_TEMP[$dev]}")
-    r5=$(parse_attr    "$data" 5)
-    r197=$(parse_attr  "$data" 197)
-    r198=$(parse_attr  "$data" 198)
-    r199=$(parse_attr  "$data" 199)
-    r9=$(parse_attr    "$data" 9)
-    r12=$(parse_attr   "$data" 12)
+    temp=$(parse_temp "$temp_data")
+    r5=$(parse_attr   "$data" 5)
+    r197=$(parse_attr "$data" 197)
+    r198=$(parse_attr "$data" 198)
+    r199=$(parse_attr "$data" 199)
+    r9=$(parse_attr   "$data" 9)
+    r12=$(parse_attr  "$data" 12)
     ata_err=$(parse_ata_err "$data")
 
     local sc="ok"
@@ -443,20 +399,17 @@ EOF
     local flag_badge=""
     [ -n "$flagused" ] && flag_badge=" <span class=\"flag-badge\">-d $flagused</span>"
 
-    # Когда последний раз делался полный опрос (раз в сутки)
-    local full_age="${PROBED_FULL_AGE[$dev]:-0}"
     local age_str
     if   [ "$full_age" -lt 3600 ];  then age_str="$((full_age / 60)) мин назад"
     elif [ "$full_age" -lt 86400 ]; then age_str="$((full_age / 3600)) ч назад"
     else                                 age_str="$((full_age / 86400)) дн назад"
     fi
-    local smart_age_html="<div class=\"smart-age\">SMART (полный): обновлено ${age_str} &nbsp;·&nbsp; температура: каждую минуту</div>"
 
     cat <<EOF
 <div class="card disk-card">
   <div class="card-title">$label <span class="dev">$dev$flag_badge</span></div>
   <div class="model">$model</div>
-  $smart_age_html
+  <div class="smart-age">SMART (полный): обновлено ${age_str} &nbsp;·&nbsp; температура: каждую минуту</div>
   <div class="attrs">
     <div class="attr"><span class="attr-name">Статус</span><span class="attr-val $sc">$status</span></div>
     <div class="attr"><span class="attr-name">Температура</span><span class="attr-val $tc">${temp:-н/д}°C</span></div>
@@ -494,14 +447,22 @@ fs_rows() {
 }
 
 # ===========================================================================
-# Собираем данные для HTML
+# Собираем HTML
+# Все параметры для disk_block берём из основного shell (не из subshell)
 # ===========================================================================
 
 DISK_BLOCKS=""
 DISK_NUM=0
 for dev in "${ALL_DEVS[@]}"; do
     DISK_NUM=$((DISK_NUM + 1))
-    DISK_BLOCKS="${DISK_BLOCKS}$(disk_block "$dev" "Диск $DISK_NUM")"$'\n'
+    k=$(safe_key "$dev")
+    DISK_BLOCKS+="$(disk_block \
+        "$dev" \
+        "Диск $DISK_NUM" \
+        "${PROBED_DATA[$k]}" \
+        "${PROBED_FLAGS[$k]}" \
+        "${PROBED_FULL_AGE[$k]:-0}" \
+        "${PROBED_TEMP[$k]}")"$'\n'
 done
 
 FS_ROWS=$(fs_rows)
@@ -530,21 +491,16 @@ if [ "$SWAP_TOTAL" -gt 0 ]; then
     SWAP_HTML="<div class=\"metric\" style=\"margin-top:12px\"><span class=\"metric-name\">Swap</span><span class=\"metric-val $SWAP_CLS\">${SWAP_PCT}%</span></div><div style=\"font-size:12px;color:var(--muted);margin-bottom:6px\">${SWAP_USED} МБ / ${SWAP_TOTAL} МБ</div>${SWAP_BAR}"
 fi
 
-# ---------------------------------------------------------------------------
-# Блок пиков
-# ---------------------------------------------------------------------------
 PEAKS_HTML=""
 if [ "$CHART_HAS_DATA" -eq 1 ]; then
     P_CPU_T_CLS=$(pct_cls "${PEAK_CPU_TEMP_VAL%.*}" 70 85)
-    P_GPU_T_CLS=$(pct_cls "${PEAK_GPU_TEMP_VAL%.*}" 75 90)
     P_CPU_L_CLS=$(pct_cls "${PEAK_CPU_LOAD_VAL:-0}")
     P_RAM_CLS=$(pct_cls "${PEAK_RAM_VAL:-0}" 75 90)
 
     DISK_PEAK_CARDS=""
     for i in "${!ALL_DEVS[@]}"; do
         dev="${ALL_DEVS[$i]}"
-        pval="${PEAK_DISK_TEMP_VAL[$i]:-—}"
-        ptime="${PEAK_DISK_TEMP_TIME[$i]}"
+        pval="${PEAK_DISK_TEMP_VAL[$i]:-—}"; ptime="${PEAK_DISK_TEMP_TIME[$i]}"
         p_tc=$(pct_cls "${pval%.*}" 50 55)
         DISK_PEAK_CARDS+="<div class=\"card\"><div class=\"card-title\">Темп. $dev</div>"
         DISK_PEAK_CARDS+="<div class=\"metric\"><span class=\"metric-name\">Максимум</span><span class=\"metric-val $p_tc\">${pval}°C</span></div>"
@@ -553,9 +509,8 @@ if [ "$CHART_HAS_DATA" -eq 1 ]; then
 
     GPU_PEAK_CARD=""
     if [ -n "$PEAK_GPU_TEMP_VAL" ]; then
-        GPU_PEAK_CARD="<div class=\"card\"><div class=\"card-title\">Температура GPU</div>
-<div class=\"metric\"><span class=\"metric-name\">Максимум</span><span class=\"metric-val $P_GPU_T_CLS\">${PEAK_GPU_TEMP_VAL:-—}°C</span></div>
-<div style=\"font-size:12px;color:var(--muted)\">${PEAK_GPU_TEMP_TIME}</div></div>"
+        P_GPU_T_CLS=$(pct_cls "${PEAK_GPU_TEMP_VAL%.*}" 75 90)
+        GPU_PEAK_CARD="<div class=\"card\"><div class=\"card-title\">Температура GPU</div><div class=\"metric\"><span class=\"metric-name\">Максимум</span><span class=\"metric-val $P_GPU_T_CLS\">${PEAK_GPU_TEMP_VAL}°C</span></div><div style=\"font-size:12px;color:var(--muted)\">${PEAK_GPU_TEMP_TIME}</div></div>"
     fi
 
     PEAKS_HTML=$(cat <<PEAKSEOF
@@ -583,105 +538,63 @@ PEAKSEOF
     )
 fi
 
-# ---------------------------------------------------------------------------
-# Canvas-блок графиков
-# ---------------------------------------------------------------------------
 CHARTS_HTML=""
 if [ "$CHART_HAS_DATA" -eq 1 ]; then
     CHARTS_HTML='<div class="section-title">История за 24 часа</div>
 <div class="charts-grid">
-  <div class="card chart-card">
-    <div class="card-title" style="margin-bottom:12px">Температуры</div>
-    <canvas id="chartTemp"></canvas>
-  </div>
-  <div class="card chart-card">
-    <div class="card-title" style="margin-bottom:12px">Загрузка системы</div>
-    <canvas id="chartRes"></canvas>
-  </div>
-  <div class="card chart-card">
-    <div class="card-title" style="margin-bottom:12px">Reallocated Sectors (здоровье дисков)</div>
-    <canvas id="chartR5"></canvas>
-  </div>
-  <div class="card chart-card">
-    <div class="card-title" style="margin-bottom:12px">UDMA CRC Errors (качество кабелей/USB)</div>
-    <canvas id="chartCrc"></canvas>
-  </div>
+  <div class="card chart-card"><div class="card-title" style="margin-bottom:12px">Температуры</div><canvas id="chartTemp"></canvas></div>
+  <div class="card chart-card"><div class="card-title" style="margin-bottom:12px">Загрузка системы</div><canvas id="chartRes"></canvas></div>
+  <div class="card chart-card"><div class="card-title" style="margin-bottom:12px">Reallocated Sectors (здоровье дисков)</div><canvas id="chartR5"></canvas></div>
+  <div class="card chart-card"><div class="card-title" style="margin-bottom:12px">UDMA CRC Errors (качество кабелей/USB)</div><canvas id="chartCrc"></canvas></div>
 </div>'
 fi
 
-# ---------------------------------------------------------------------------
-# JS-блок Chart.js
-# ---------------------------------------------------------------------------
 CHART_SCRIPT=""
 if [ "$CHART_HAS_DATA" -eq 1 ]; then
     GPU_DATASET_LINE=""
     [ -n "$PEAK_GPU_TEMP_VAL" ] && \
-        GPU_DATASET_LINE='{ label: "GPU", data: gpuTempData, borderColor: "#4caf50", backgroundColor: "#4caf5022", borderWidth:1.5, pointRadius:0, tension:0.3, fill:false },'
+        GPU_DATASET_LINE='{ label:"GPU", data:gpuTempData, borderColor:"#4caf50", backgroundColor:"#4caf5022", borderWidth:1.5, pointRadius:0, tension:0.3, fill:false },'
 
     CHART_SCRIPT=$(cat <<JSEOF
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script>
 (function(){
-  const labels         = [$CHART_LABELS];
-  const cpuTempData    = [$CHART_CPU_TEMP_DATA];
-  const gpuTempData    = [$CHART_GPU_TEMP_DATA];
-  const cpuLoadData    = [$CHART_CPU_LOAD_DATA];
-  const ramData        = [$CHART_RAM_DATA];
-  const diskTempDS     = $CHART_DISK_TEMP_DATASETS;
-  const diskR5DS       = $CHART_DISK_R5_DATASETS;
-  const diskCrcDS      = $CHART_DISK_R199_DATASETS;
+  const labels        = [$CHART_LABELS];
+  const cpuTempData   = [$CHART_CPU_TEMP_DATA];
+  const gpuTempData   = [$CHART_GPU_TEMP_DATA];
+  const cpuLoadData   = [$CHART_CPU_LOAD_DATA];
+  const ramData       = [$CHART_RAM_DATA];
+  const diskTempDS    = $CHART_DISK_TEMP_DATASETS;
+  const diskR5DS      = $CHART_DISK_R5_DATASETS;
+  const diskCrcDS     = $CHART_DISK_R199_DATASETS;
 
-  Chart.defaults.color       = '#888';
-  Chart.defaults.borderColor = '#2a2d3a';
-  Chart.defaults.font.family = "'Segoe UI', system-ui, sans-serif";
-  Chart.defaults.font.size   = 11;
+  Chart.defaults.color = '#888'; Chart.defaults.borderColor = '#2a2d3a';
+  Chart.defaults.font.family = "'Segoe UI',system-ui,sans-serif"; Chart.defaults.font.size = 11;
 
-  const xAxis = {
-    ticks: {
-      maxTicksLimit: 8, maxRotation: 0,
-      callback: function(val) {
-        const l = this.getLabelForValue(val);
-        return l ? l.slice(11,16) : '';
-      }
-    }
-  };
+  const xAxis = { ticks: { maxTicksLimit:8, maxRotation:0,
+    callback: function(v){ const l=this.getLabelForValue(v); return l?l.slice(11,16):''; } } };
   const tip = { backgroundColor:'#1a1d27', borderColor:'#2a2d3a', borderWidth:1 };
   const leg = { position:'bottom', labels:{ usePointStyle:true, padding:12, font:{size:11} } };
 
-  function makeChart(id, datasets, yTitle, yMin) {
-    new Chart(document.getElementById(id), {
-      type: 'line',
-      data: { labels, datasets },
-      options: {
-        responsive: true, maintainAspectRatio: true, animation: false,
-        interaction: { mode:'index', intersect:false },
-        plugins: { legend: leg, tooltip: tip },
-        scales: {
-          x: xAxis,
-          y: {
-            beginAtZero: yMin !== undefined,
-            min: yMin,
-            ticks: { maxTicksLimit:6 },
-            title: { display:true, text: yTitle, color:'#888' }
-          }
-        }
-      }
-    });
+  function mkChart(id, datasets, yTitle, yMin) {
+    new Chart(document.getElementById(id), { type:'line', data:{labels,datasets},
+      options:{ responsive:true, maintainAspectRatio:true, animation:false,
+        interaction:{mode:'index',intersect:false}, plugins:{legend:leg,tooltip:tip},
+        scales:{ x:xAxis, y:{ beginAtZero:yMin!==undefined, min:yMin,
+          ticks:{maxTicksLimit:6}, title:{display:true,text:yTitle,color:'#888'} } } } });
   }
 
-  makeChart('chartTemp', [
-    { label:'CPU (ядра)', data:cpuTempData, borderColor:'#f44336', backgroundColor:'#f4433622', borderWidth:1.5, pointRadius:0, tension:0.3, fill:false },
+  mkChart('chartTemp', [
+    {label:'CPU (ядра)',data:cpuTempData,borderColor:'#f44336',backgroundColor:'#f4433622',borderWidth:1.5,pointRadius:0,tension:0.3,fill:false},
     $GPU_DATASET_LINE
     ...diskTempDS
   ], '\u00b0C');
-
-  makeChart('chartRes', [
-    { label:'CPU %',  data:cpuLoadData, borderColor:'#7c4dff', backgroundColor:'#7c4dff22', borderWidth:1.5, pointRadius:0, tension:0.3, fill:true },
-    { label:'RAM %',  data:ramData,     borderColor:'#00bcd4', backgroundColor:'#00bcd422', borderWidth:1.5, pointRadius:0, tension:0.3, fill:true }
+  mkChart('chartRes', [
+    {label:'CPU %',data:cpuLoadData,borderColor:'#7c4dff',backgroundColor:'#7c4dff22',borderWidth:1.5,pointRadius:0,tension:0.3,fill:true},
+    {label:'RAM %',data:ramData,    borderColor:'#00bcd4',backgroundColor:'#00bcd422',borderWidth:1.5,pointRadius:0,tension:0.3,fill:true}
   ], '%', 0);
-
-  makeChart('chartR5',  diskR5DS,  'секторы', 0);
-  makeChart('chartCrc', diskCrcDS, 'ошибки',  0);
+  mkChart('chartR5',  diskR5DS,  'секторы', 0);
+  mkChart('chartCrc', diskCrcDS, 'ошибки',  0);
 })();
 </script>
 JSEOF
@@ -707,40 +620,40 @@ cat > "$OUTPUT" <<HTML
   --text: #e0e0e0; --muted: #888;
   --ok: #4caf50; --warn: #ff9800; --crit: #f44336; --accent: #7c4dff;
 }
-body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; font-size: 14px; padding: 16px; }
-h1 { font-size: 20px; font-weight: 600; margin-bottom: 4px; }
-.updated { color: var(--muted); font-size: 12px; margin-bottom: 20px; }
-.section-title { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 24px 0 10px; }
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
-.charts-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 12px; }
-.card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
-.chart-card { padding: 16px 16px 12px; }
-.card-title { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
-.dev { color: var(--muted); font-size: 11px; font-weight: 400; margin-left: 6px; }
-.model { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
-.smart-age { color: var(--muted); font-size: 11px; margin-bottom: 12px; }
-.flag-badge { background: #2a2d3a; border-radius: 4px; padding: 1px 5px; font-size: 10px; font-family: monospace; }
-.metric { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
-.metric-name { color: var(--muted); font-size: 13px; }
-.metric-val { font-size: 22px; font-weight: 700; }
-.metric-val.ok, .attr-val.ok     { color: var(--ok); }
-.metric-val.warn, .attr-val.warn  { color: var(--warn); }
-.metric-val.critical, .attr-val.critical { color: var(--crit); }
-.attr-val.unknown { color: var(--muted); }
-.attrs { display: flex; flex-direction: column; gap: 6px; }
-.attr { display: flex; justify-content: space-between; align-items: center; font-size: 13px; padding: 4px 0; border-bottom: 1px solid var(--border); }
-.attr:last-child { border-bottom: none; }
-.attr-name { color: var(--muted); }
-.attr-val { font-weight: 600; }
-.bar-wrap { background: var(--border); border-radius: 4px; height: 6px; width: 120px; overflow: hidden; display: inline-block; vertical-align: middle; margin-left: 8px; }
-.bar { height: 100%; border-radius: 4px; }
-.bar.ok { background: var(--ok); } .bar.warn { background: var(--warn); } .bar.critical { background: var(--crit); }
-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-th { text-align: left; color: var(--muted); font-weight: 600; padding: 6px 8px; border-bottom: 1px solid var(--border); }
-td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
-tr.critical td { color: var(--crit); }
-tr:hover td { background: rgba(255,255,255,.03); }
-.disk-card { border-left: 3px solid var(--accent); }
+body { background:var(--bg); color:var(--text); font-family:'Segoe UI',system-ui,sans-serif; font-size:14px; padding:16px; }
+h1 { font-size:20px; font-weight:600; margin-bottom:4px; }
+.updated { color:var(--muted); font-size:12px; margin-bottom:20px; }
+.section-title { font-size:13px; font-weight:600; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:24px 0 10px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:12px; }
+.charts-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(420px,1fr)); gap:12px; }
+.card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:16px; }
+.chart-card { padding:16px 16px 12px; }
+.card-title { font-size:15px; font-weight:600; margin-bottom:4px; }
+.dev { color:var(--muted); font-size:11px; font-weight:400; margin-left:6px; }
+.model { color:var(--muted); font-size:12px; margin-bottom:4px; }
+.smart-age { color:var(--muted); font-size:11px; margin-bottom:12px; }
+.flag-badge { background:#2a2d3a; border-radius:4px; padding:1px 5px; font-size:10px; font-family:monospace; }
+.metric { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
+.metric-name { color:var(--muted); font-size:13px; }
+.metric-val { font-size:22px; font-weight:700; }
+.metric-val.ok, .attr-val.ok     { color:var(--ok); }
+.metric-val.warn, .attr-val.warn  { color:var(--warn); }
+.metric-val.critical, .attr-val.critical { color:var(--crit); }
+.attr-val.unknown { color:var(--muted); }
+.attrs { display:flex; flex-direction:column; gap:6px; }
+.attr { display:flex; justify-content:space-between; align-items:center; font-size:13px; padding:4px 0; border-bottom:1px solid var(--border); }
+.attr:last-child { border-bottom:none; }
+.attr-name { color:var(--muted); }
+.attr-val { font-weight:600; }
+.bar-wrap { background:var(--border); border-radius:4px; height:6px; width:120px; overflow:hidden; display:inline-block; vertical-align:middle; margin-left:8px; }
+.bar { height:100%; border-radius:4px; }
+.bar.ok{background:var(--ok)} .bar.warn{background:var(--warn)} .bar.critical{background:var(--crit)}
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th { text-align:left; color:var(--muted); font-weight:600; padding:6px 8px; border-bottom:1px solid var(--border); }
+td { padding:6px 8px; border-bottom:1px solid var(--border); }
+tr.critical td { color:var(--crit); }
+tr:hover td { background:rgba(255,255,255,.03); }
+.disk-card { border-left:3px solid var(--accent); }
 </style>
 </head>
 <body>
