@@ -3,10 +3,15 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # /usr/local/bin/nas-dashboard.sh
 # NAS Monitor — универсальный дашборд с историей метрик и графиками
 # Запускается через cron каждую минуту от root
+#
+# SMART-данные кэшируются — диски опрашиваются только раз в день,
+# системные метрики (CPU/RAM) обновляются каждую минуту без лишних обращений к пластинам.
 
 OUTPUT="/var/www/nas-dashboard/index.html"
 METRICS_CSV="/var/www/nas-dashboard/metrics.csv"
-CSV_MAX_LINES=10080   # 7 суток × 1440 мин
+CSV_MAX_LINES=10080     # 7 суток × 1440 мин
+SMART_FULL_TTL=86400    # полный SMART (здоровье, секторы, ошибки) — раз в сутки
+SMART_TEMP_TTL=60       # температура (лёгкий запрос -A -H) — каждую минуту
 UPDATED=$(date '+%d.%m.%Y %H:%M:%S')
 TS=$(date '+%Y-%m-%d %H:%M')
 
@@ -53,7 +58,6 @@ fi
 
 # Температура GPU (Intel integrated / дискретная / hwmon)
 GPU_TEMP=""
-# Попытка 1: Intel/AMD через hwmon sysfs
 for f in /sys/class/drm/card0/device/hwmon/hwmon*/temp1_input \
           /sys/class/drm/card1/device/hwmon/hwmon*/temp1_input; do
     [ -r "$f" ] || continue
@@ -63,18 +67,16 @@ for f in /sys/class/drm/card0/device/hwmon/hwmon*/temp1_input \
         break
     fi
 done
-# Попытка 2: sensors (nvidia / amdgpu / radeon)
 if [ -z "$GPU_TEMP" ] && command -v sensors &>/dev/null; then
     GPU_TEMP=$(sensors 2>/dev/null \
-        | grep -iE "^(GPU|edge|junction|temp1):" \
-        | grep -v "acpitz" \
+        | grep -iE "^(GPU|edge|junction):" \
         | head -1 \
         | grep -oP '[+-]\K[0-9]+\.[0-9]+' \
         | head -1)
 fi
-# Попытка 3: nvidia-smi
 if [ -z "$GPU_TEMP" ] && command -v nvidia-smi &>/dev/null; then
-    GPU_TEMP=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')
+    GPU_TEMP=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader 2>/dev/null \
+        | head -1 | tr -d ' ')
 fi
 
 # ===========================================================================
@@ -104,6 +106,7 @@ detect_disks() {
     lsblk -dpno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}'
 }
 
+# Базовый зонд без кэша (используется внутри probe_smart_cached)
 probe_smart() {
     local dev=$1
     local flags=("" "sat,12" "sat,16" "sat" "usbsunplus" "usbjmicron" "usbcypress")
@@ -123,6 +126,57 @@ probe_smart() {
     SMART_DATA=""
     SMART_FLAG=""
     return 1
+}
+
+# Двухуровневый зонд с кэшем:
+#   _full.data — полный «smartctl -a» (раз в сутки): здоровье, секторы, журналы
+#   _temp.data — лёгкий «smartctl -A -H» (каждую минуту): только атрибуты + статус
+# Результаты: SMART_FULL_DATA, SMART_TEMP_DATA, SMART_FLAG, SMART_FULL_AGE
+probe_disk() {
+    local dev=$1
+    local safe="${dev//\//_}"
+    local full_f="/tmp/nas_smart_${safe}_full.data"
+    local temp_f="/tmp/nas_smart_${safe}_temp.data"
+    local flag_f="/tmp/nas_smart_${safe}.flag"
+    local now
+    now=$(date +%s)
+
+    # --- Полный SMART (раз в сутки) ---
+    local full_age=99999
+    [ -f "$full_f" ] && full_age=$(( now - $(stat -c %Y "$full_f") ))
+    SMART_FULL_AGE=$full_age
+
+    if [ "$full_age" -ge "$SMART_FULL_TTL" ]; then
+        # Первый запуск или сутки прошли — полный опрос с автоопределением флага
+        probe_smart "$dev"
+        printf '%s' "$SMART_DATA" > "$full_f"
+        printf '%s' "$SMART_FLAG" > "$flag_f"
+        # Полные данные используем и как temp-кэш (содержат атрибуты)
+        printf '%s' "$SMART_DATA" > "$temp_f"
+        SMART_FULL_DATA="$SMART_DATA"
+        SMART_TEMP_DATA="$SMART_DATA"
+        return
+    fi
+
+    SMART_FULL_DATA=$(cat "$full_f")
+    SMART_FLAG=$(cat "$flag_f" 2>/dev/null)
+
+    # --- Температура (каждую минуту, лёгкий запрос) ---
+    local temp_age=99999
+    [ -f "$temp_f" ] && temp_age=$(( now - $(stat -c %Y "$temp_f") ))
+
+    if [ "$temp_age" -ge "$SMART_TEMP_TTL" ]; then
+        local raw
+        if [ -n "$SMART_FLAG" ]; then
+            raw=$(/usr/sbin/smartctl -d "$SMART_FLAG" -A -H "$dev" 2>/dev/null)
+        else
+            raw=$(/usr/sbin/smartctl -A -H "$dev" 2>/dev/null)
+        fi
+        printf '%s' "$raw" > "$temp_f"
+        SMART_TEMP_DATA="$raw"
+    else
+        SMART_TEMP_DATA=$(cat "$temp_f")
+    fi
 }
 
 # ===========================================================================
@@ -164,13 +218,14 @@ parse_ata_err() {
 }
 
 # ===========================================================================
-# Pass 1: Зондируем все диски (не в subshell → ассоциативные массивы работают)
+# Pass 1: Зондируем все диски через кэш (не в subshell → массивы работают)
 # ===========================================================================
 
 declare -a ALL_DEVS=()
-declare -A PROBED_DATA=()
+declare -A PROBED_DATA=()       # полный SMART (раз в сутки)
+declare -A PROBED_TEMP=()       # данные температуры (каждую минуту)
 declare -A PROBED_FLAGS=()
-# Массивы для CSV (4 метрики на диск: temp, r5, r197, r199)
+declare -A PROBED_FULL_AGE=()   # возраст полного кэша в секундах
 declare -a CSV_TEMP=()
 declare -a CSV_R5=()
 declare -a CSV_R197=()
@@ -178,27 +233,29 @@ declare -a CSV_R199=()
 
 while IFS= read -r dev; do
     ALL_DEVS+=("$dev")
-    probe_smart "$dev"
-    PROBED_DATA["$dev"]="$SMART_DATA"
+    probe_disk "$dev"
+    PROBED_DATA["$dev"]="$SMART_FULL_DATA"
+    PROBED_TEMP["$dev"]="$SMART_TEMP_DATA"
     PROBED_FLAGS["$dev"]="$SMART_FLAG"
-    CSV_TEMP+=("$(parse_temp "$SMART_DATA")")
-    CSV_R5+=("$(parse_attr  "$SMART_DATA" 5)")
-    CSV_R197+=("$(parse_attr "$SMART_DATA" 197)")
-    CSV_R199+=("$(parse_attr "$SMART_DATA" 199)")
+    PROBED_FULL_AGE["$dev"]="$SMART_FULL_AGE"
+
+    # В CSV пишем температуру из свежих данных, остальное из полного кэша
+    CSV_TEMP+=("$(parse_temp "$SMART_TEMP_DATA")")
+    CSV_R5+=("$(parse_attr  "$SMART_FULL_DATA" 5)")
+    CSV_R197+=("$(parse_attr "$SMART_FULL_DATA" 197)")
+    CSV_R199+=("$(parse_attr "$SMART_FULL_DATA" 199)")
 done < <(detect_disks)
 
 # ===========================================================================
 # CSV: миграция схемы + запись + обрезка
 # ===========================================================================
 
-# Строим ожидаемый заголовок (меняется если добавить диск)
 expected_header="timestamp,cpu_temp,gpu_temp,cpu_load,ram_pct"
 for dev in "${ALL_DEVS[@]}"; do
-    ds="${dev//\//}"   # /dev/sda → devsda
+    ds="${dev//\//}"
     expected_header="${expected_header},${ds}_temp,${ds}_r5,${ds}_r197,${ds}_r199"
 done
 
-# Если заголовок не совпадает — архивируем старый CSV и начинаем заново
 if [ -f "$METRICS_CSV" ]; then
     actual_header=$(head -1 "$METRICS_CSV" 2>/dev/null)
     if [ "$actual_header" != "$expected_header" ]; then
@@ -206,17 +263,14 @@ if [ -f "$METRICS_CSV" ]; then
     fi
 fi
 
-# Создаём новый с заголовком
 [ ! -f "$METRICS_CSV" ] && echo "$expected_header" > "$METRICS_CSV"
 
-# Дописываем строку данных
 csv_line="$TS,${CPU_TEMP:-},${GPU_TEMP:-},${CPU_USED},${RAM_PCT}"
 for i in "${!ALL_DEVS[@]}"; do
     csv_line="${csv_line},${CSV_TEMP[$i]:-},${CSV_R5[$i]:-},${CSV_R197[$i]:-},${CSV_R199[$i]:-}"
 done
 echo "$csv_line" >> "$METRICS_CSV"
 
-# Держим заголовок + последние CSV_MAX_LINES строк данных
 {
     head -1 "$METRICS_CSV"
     tail -n +2 "$METRICS_CSV" | tail -n "$CSV_MAX_LINES"
@@ -252,7 +306,6 @@ if [ -f "$METRICS_CSV" ] && [ -s "$METRICS_CSV" ]; then
 
         CHART_LABELS=$(echo "$CSV_DATA" \
             | awk -F',' '{printf "\"%s\",",$1}' | sed 's/,$//')
-        # col2=cpu_temp, col3=gpu_temp, col4=cpu_load, col5=ram_pct
         CHART_CPU_TEMP_DATA=$(echo "$CSV_DATA" \
             | awk -F',' '{print ($2=="" ? "null" : $2)}' | tr '\n' ',' | sed 's/,$//')
         CHART_GPU_TEMP_DATA=$(echo "$CSV_DATA" \
@@ -262,7 +315,6 @@ if [ -f "$METRICS_CSV" ] && [ -s "$METRICS_CSV" ]; then
         CHART_RAM_DATA=$(echo "$CSV_DATA" \
             | awk -F',' '{print ($5=="" ? "null" : $5)}' | tr '\n' ',' | sed 's/,$//')
 
-        # Диски: начиная с col6, шаг 4: temp(+0), r5(+1), r197(+2), r199(+3)
         DISK_COLORS=("#ff9800" "#7c4dff" "#00bcd4" "#4caf50")
         CHART_DISK_TEMP_DATASETS="["
         CHART_DISK_R5_DATASETS="["
@@ -291,7 +343,6 @@ if [ -f "$METRICS_CSV" ] && [ -s "$METRICS_CSV" ]; then
             CHART_DISK_R5_DATASETS+="{${ds_base},\"data\":[${r5_data}]},"
             CHART_DISK_R199_DATASETS+="{${ds_base},\"data\":[${r199_data}]},"
 
-            # Пики температур дисков
             PEAK_DISK_TEMP_VAL[$i]=$(echo "$CSV_DATA" | awk -F',' -v c="$col_temp" '$c!=""' \
                 | sort -t',' -k"$col_temp" -rn | head -1 | cut -d',' -f"$col_temp")
             PEAK_DISK_TEMP_TIME[$i]=$(echo "$CSV_DATA" | awk -F',' -v c="$col_temp" '$c!=""' \
@@ -302,7 +353,6 @@ if [ -f "$METRICS_CSV" ] && [ -s "$METRICS_CSV" ]; then
         CHART_DISK_R5_DATASETS="${CHART_DISK_R5_DATASETS%,}]"
         CHART_DISK_R199_DATASETS="${CHART_DISK_R199_DATASETS%,}]"
 
-        # Системные пики
         PEAK_CPU_TEMP_VAL=$(echo "$CSV_DATA" | awk -F',' '$2!=""' \
             | sort -t',' -k2 -rn | head -1 | cut -d',' -f2)
         PEAK_CPU_TEMP_TIME=$(echo "$CSV_DATA" | awk -F',' '$2!=""' \
@@ -331,6 +381,7 @@ disk_block() {
     local label=$2
     local data="${PROBED_DATA[$dev]}"
     local flagused="${PROBED_FLAGS[$dev]}"
+    local cache_age="${PROBED_CACHE_AGE[$dev]:-0}"
 
     if [ -z "$data" ]; then
         cat <<EOF
@@ -345,7 +396,7 @@ EOF
     local model status temp r5 r197 r198 r199 r9 r12 ata_err
     model=$(parse_model "$data")
     status=$(parse_status "$data")
-    temp=$(parse_temp "$data")
+    temp=$(parse_temp "${PROBED_TEMP[$dev]}")
     r5=$(parse_attr    "$data" 5)
     r197=$(parse_attr  "$data" 197)
     r198=$(parse_attr  "$data" 198)
@@ -392,10 +443,20 @@ EOF
     local flag_badge=""
     [ -n "$flagused" ] && flag_badge=" <span class=\"flag-badge\">-d $flagused</span>"
 
+    # Когда последний раз делался полный опрос (раз в сутки)
+    local full_age="${PROBED_FULL_AGE[$dev]:-0}"
+    local age_str
+    if   [ "$full_age" -lt 3600 ];  then age_str="$((full_age / 60)) мин назад"
+    elif [ "$full_age" -lt 86400 ]; then age_str="$((full_age / 3600)) ч назад"
+    else                                 age_str="$((full_age / 86400)) дн назад"
+    fi
+    local smart_age_html="<div class=\"smart-age\">SMART (полный): обновлено ${age_str} &nbsp;·&nbsp; температура: каждую минуту</div>"
+
     cat <<EOF
 <div class="card disk-card">
   <div class="card-title">$label <span class="dev">$dev$flag_badge</span></div>
   <div class="model">$model</div>
+  $smart_age_html
   <div class="attrs">
     <div class="attr"><span class="attr-name">Статус</span><span class="attr-val $sc">$status</span></div>
     <div class="attr"><span class="attr-name">Температура</span><span class="attr-val $tc">${temp:-н/д}°C</span></div>
@@ -479,7 +540,6 @@ if [ "$CHART_HAS_DATA" -eq 1 ]; then
     P_CPU_L_CLS=$(pct_cls "${PEAK_CPU_LOAD_VAL:-0}")
     P_RAM_CLS=$(pct_cls "${PEAK_RAM_VAL:-0}" 75 90)
 
-    # Карточки пиков дисков
     DISK_PEAK_CARDS=""
     for i in "${!ALL_DEVS[@]}"; do
         dev="${ALL_DEVS[$i]}"
@@ -528,11 +588,6 @@ fi
 # ---------------------------------------------------------------------------
 CHARTS_HTML=""
 if [ "$CHART_HAS_DATA" -eq 1 ]; then
-    # Добавляем GPU в легенду только если есть данные
-    GPU_LINE=""
-    [ -n "$PEAK_GPU_TEMP_VAL" ] && \
-        GPU_LINE='{ label: "GPU", data: gpuTempData, borderColor: "#4caf50", backgroundColor: "#4caf5022", borderWidth:1.5, pointRadius:0, tension:0.3, fill:false },'
-
     CHARTS_HTML='<div class="section-title">История за 24 часа</div>
 <div class="charts-grid">
   <div class="card chart-card">
@@ -614,25 +669,19 @@ if [ "$CHART_HAS_DATA" -eq 1 ]; then
     });
   }
 
-  // 1. Температуры: CPU + GPU + диски
   makeChart('chartTemp', [
     { label:'CPU (ядра)', data:cpuTempData, borderColor:'#f44336', backgroundColor:'#f4433622', borderWidth:1.5, pointRadius:0, tension:0.3, fill:false },
     $GPU_DATASET_LINE
     ...diskTempDS
   ], '\u00b0C');
 
-  // 2. Загрузка системы
   makeChart('chartRes', [
     { label:'CPU %',  data:cpuLoadData, borderColor:'#7c4dff', backgroundColor:'#7c4dff22', borderWidth:1.5, pointRadius:0, tension:0.3, fill:true },
     { label:'RAM %',  data:ramData,     borderColor:'#00bcd4', backgroundColor:'#00bcd422', borderWidth:1.5, pointRadius:0, tension:0.3, fill:true }
   ], '%', 0);
 
-  // 3. Reallocated Sectors (attr 5) — должны быть нулями
-  makeChart('chartR5', diskR5DS, 'секторы', 0);
-
-  // 4. UDMA CRC Errors (attr 199) — тренд ошибок USB/кабеля
-  makeChart('chartCrc', diskCrcDS, 'ошибки', 0);
-
+  makeChart('chartR5',  diskR5DS,  'секторы', 0);
+  makeChart('chartCrc', diskCrcDS, 'ошибки',  0);
 })();
 </script>
 JSEOF
@@ -668,7 +717,8 @@ h1 { font-size: 20px; font-weight: 600; margin-bottom: 4px; }
 .chart-card { padding: 16px 16px 12px; }
 .card-title { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
 .dev { color: var(--muted); font-size: 11px; font-weight: 400; margin-left: 6px; }
-.model { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+.model { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+.smart-age { color: var(--muted); font-size: 11px; margin-bottom: 12px; }
 .flag-badge { background: #2a2d3a; border-radius: 4px; padding: 1px 5px; font-size: 10px; font-family: monospace; }
 .metric { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
 .metric-name { color: var(--muted); font-size: 13px; }
