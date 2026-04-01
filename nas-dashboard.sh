@@ -4,7 +4,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # NAS Monitor — универсальный дашборд с историей метрик и графиками
 # Запускается через cron каждую минуту от root
 #
-# Температура дисков — каждую минуту (smartctl -A -H, лёгкий запрос)
+# Температура дисков — каждый час (smartctl -A -H, лёгкий запрос)
 # Полный SMART      — раз в сутки   (smartctl -a, читает журналы с пластин)
 #
 # ВАЖНО: ключи ассоциативных массивов используют безопасный формат _dev_sda
@@ -14,7 +14,7 @@ OUTPUT="/var/www/nas-dashboard/index.html"
 METRICS_CSV="/var/www/nas-dashboard/metrics.csv"
 CSV_MAX_LINES=10080     # 7 суток × 1440 мин
 SMART_FULL_TTL=86400    # полный SMART — раз в сутки
-SMART_TEMP_TTL=60       # температура  — каждую минуту
+SMART_TEMP_TTL=3600       # температура  — каждый час
 UPDATED=$(date '+%d.%m.%Y %H:%M:%S')
 TS=$(date '+%Y-%m-%d %H:%M')
 
